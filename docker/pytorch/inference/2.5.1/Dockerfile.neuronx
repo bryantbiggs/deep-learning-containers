@@ -1,17 +1,23 @@
 # syntax=docker/dockerfile:1
 
-FROM public.ecr.aws/docker/library/ubuntu:24.04 AS base
+FROM public.ecr.aws/docker/library/ubuntu:22.04 AS base
+
+ARG VLLM_VERSION=0.7.2
+ARG EFA_INSTALLER_VERSION=1.37.0
 
 # Neuron SDK components version numbers
-ARG NEURONX_CC_VERSION=2.16.372.0
-ARG NEURONX_FRAMEWORK_VERSION=2.5.1.2.4.0
+ARG TORCH_VERSION=2.5.1
+ARG TORCH_NEURONX_VERSION=${TORCH_VERSION}.2.4.0
 ARG NEURONX_TRANSFORMERS_VERSION=0.13.380
 ARG NEURONX_COLLECTIVES_LIB_VERSION=2.23.135.0-3e70920f2
 ARG NEURONX_RUNTIME_LIB_VERSION=2.23.112.0-9b5179492
 ARG NEURONX_DISTRIBUTED_VERSION=0.10.1
 ARG NEURONX_DISTRIBUTED_INFERENCE_VERSION=0.1.1
 
-ARG TORCHSERVE_VERSION=0.11.0
+ARG PYTORCH_VERSION=2.5.1
+ARG PIP_ARGS='--no-cache-dir'
+# For Python 3.12+
+# ARG PIP_ARGS='--no-cache-dir --break-system-packages'
 
 ENV VLLM_TARGET_DEVICE=neuron
 ENV PYTHONUNBUFFERED=1
@@ -29,7 +35,6 @@ RUN <<EOT
     gnupg2 \
     wget
 
-  # TODO - when is noble supported?
   echo "deb https://apt.repos.neuron.amazonaws.com jammy main" > /etc/apt/sources.list.d/neuron.list
   # TODO - https://askubuntu.com/questions/1286545/what-commands-exactly-should-replace-the-deprecated-apt-key
   wget -qO - https://apt.repos.neuron.amazonaws.com/GPG-PUB-KEY-AMAZON-AWS-NEURON.PUB | apt-key add -
@@ -37,7 +42,7 @@ RUN <<EOT
 
   apt-get remove -y \
     wget
-  apt-get autoremove
+  apt-get autoremove -y
   apt-get clean
   rm -rf /var/lib/apt/lists/*
 EOT
@@ -45,18 +50,27 @@ EOT
 RUN <<EOT
   apt-get update
   apt-get install -y \
-    python3.12 \
-    python3-pip \
+    python3.11 \
+    python3.11-pip \
     python-is-python3
 
-  apt-get autoremove
+  # Set up extra index URLs for Neuron and PyTorch CPU only wheels
+  mkdir -p /root/.config/pip/
+  cat <<-EOF > /root/.config/pip/pip.conf
+[global]
+extra-index-url = https://pip.repos.neuron.amazonaws.com
+                  https://download.pytorch.org/whl/cpu/
+EOF
+
+  # apt-get remove python3.10 -y
+  apt-get autoremove -y
   apt-get clean
    rm -rf /var/lib/apt/lists/*
 EOT
 
-############################################################################################################
+###########################################################
 
-FROM base AS build
+FROM base AS neuron-vllm
 
 RUN <<EOT
   apt-get update
@@ -64,44 +78,86 @@ RUN <<EOT
     aws-neuronx-collectives=${NEURONX_COLLECTIVES_LIB_VERSION} \
     aws-neuronx-runtime-lib=${NEURONX_RUNTIME_LIB_VERSION}
 
-  apt-get autoremove
+  apt-get autoremove -y
   apt-get clean
   rm -rf /var/lib/apt/lists/*
 EOT
 
 RUN <<EOT
-  pip install --no-cache-dir --upgrade --extra-index-url https://pip.repos.neuron.amazonaws.com --break-system-packages \
-    neuronx-cc==${NEURONX_CC_VERSION} \
-    torch-neuronx==${NEURONX_FRAMEWORK_VERSION} \
+  pip install $PIP_ARGS \
+    torch==${TORCH_VERSION%\.}+cpu \
+    torch-xla==${TORCH_VERSION} \
+    torch-neuronx==${TORCH_NEURONX_VERSION} \
     transformers-neuronx==${NEURONX_TRANSFORMERS_VERSION}
 
-  pip install --no-cache-dir --upgrade --extra-index-url https://pip.repos.neuron.amazonaws.com --break-system-packages \
+  # Do not bring in the dependencies of neuronx-distributed and neuronx-distributed-inference
+  pip install $PIP_ARGS --no-deps \
     neuronx_distributed==$NEURONX_DISTRIBUTED_VERSION \
     neuronx_distributed_inference==$NEURONX_DISTRIBUTED_INFERENCE_VERSION
-
 EOT
 
-ARG VLLM_VERSION=0.7.1
-
-WORKDIR /tmp
-
+# vLLM
 RUN <<EOT
   apt-get update
   apt-get install -y \
     curl
 
-  # pip install --no-cache-dir --break-system-packages \
-  #   torchserve==${TORCHSERVE_VERSION}
-
+  cd /tmp
   curl -sL https://github.com/vllm-project/vllm/releases/download/v${VLLM_VERSION}/vllm-${VLLM_VERSION}.tar.gz | tar xvz
 
   cd vllm-${VLLM_VERSION}
-  pip install --no-cache-dir --break-system-packages --no-build-isolation -v -e .
-  # rm -rf /tmp/*
+  pip install $PIP_ARGS \
+    -r requirements-neuron.txt
+  pip install $PIP_ARGS .
+  rm -rf /tmp/*
+
+  # Remove un-needed packages (no images)
+  pip uninstall $PIP_ARGS -y \
+    pillow
 
   apt-get remove -y \
     curl
-  apt-get autoremove
+  apt-get autoremove -y
   apt-get clean
   rm -rf /var/lib/apt/lists/*
 EOT
+
+# EFA installer
+RUN <<EOT
+  apt-get update
+  apt-get install -y \
+    curl
+
+  cd /tmp
+  curl -sL https://efa-installer.amazonaws.com/aws-efa-installer-${EFA_INSTALLER_VERSION}.tar.gz | tar xvz
+  cd aws-efa-installer
+
+  ./efa_installer.sh --yes --skip-kmod --skip-limit-conf --no-verify --mpi openmpi4
+
+  echo "/opt/amazon/openmpi/lib" > /etc/ld.so.conf.d/openmpi.conf
+  ldconfig
+
+  apt-get remove -y \
+    curl
+  apt-get autoremove -y
+  apt-get clean
+  rm -rf /var/lib/apt/lists/*
+EOT
+
+#################### OPENAI API SERVER ####################
+
+FROM neuron-vllm AS neuron-vllm-openai
+
+RUN <<EOT
+  pip install $PIP_ARGS \
+    accelerate \
+    hf_transfer \
+    'modelscope!=1.15.0' \
+    'bitsandbytes>=0.42.0' \
+    'timm==0.9.10' \
+    boto3 \
+    runai-model-streamer \
+    runai-model-streamer[s3]
+EOT
+
+ENTRYPOINT ["python3", "-m", "vllm.entrypoints.openai.api_server"]
