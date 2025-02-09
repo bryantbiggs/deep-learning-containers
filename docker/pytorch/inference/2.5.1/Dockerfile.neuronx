@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 
-FROM public.ecr.aws/docker/library/ubuntu:22.04 AS base
+FROM python:3.11-slim-bookworm AS base
 
 ARG VLLM_VERSION=0.7.2
 ARG EFA_INSTALLER_VERSION=1.37.0
@@ -21,6 +21,7 @@ ARG PIP_ARGS='--no-cache-dir'
 
 ENV VLLM_TARGET_DEVICE=neuron
 ENV PYTHONUNBUFFERED=1
+ARG PIP_ROOT_USER_ACTION=ignore
 
 RUN <<EOT
   rm -f /etc/apt/apt.conf.d/docker-clean
@@ -29,32 +30,7 @@ RUN <<EOT
   echo 'APT::Install-Recommends "0";' >> /etc/apt/apt.conf.d/00-docker
   echo 'debconf debconf/frontend select Noninteractive' | debconf-set-selections
 
-  apt-get update
-  apt-get install -y \
-    ca-certificates \
-    gnupg2 \
-    wget
-
-  echo "deb https://apt.repos.neuron.amazonaws.com jammy main" > /etc/apt/sources.list.d/neuron.list
-  # TODO - https://askubuntu.com/questions/1286545/what-commands-exactly-should-replace-the-deprecated-apt-key
-  wget -qO - https://apt.repos.neuron.amazonaws.com/GPG-PUB-KEY-AMAZON-AWS-NEURON.PUB | apt-key add -
-  apt-get update
-
-  apt-get remove -y \
-    wget
-  apt-get autoremove -y
-  apt-get clean
-  rm -rf /var/lib/apt/lists/*
-EOT
-
-RUN <<EOT
-  apt-get update
-  apt-get install -y \
-    python3.11 \
-    python3.11-pip \
-    python-is-python3
-
-  # Set up extra index URLs for Neuron and PyTorch CPU only wheels
+    # Set up extra index URLs for Neuron and PyTorch CPU only wheels
   mkdir -p /root/.config/pip/
   cat <<-EOF > /root/.config/pip/pip.conf
 [global]
@@ -62,10 +38,26 @@ extra-index-url = https://pip.repos.neuron.amazonaws.com
                   https://download.pytorch.org/whl/cpu/
 EOF
 
-  # apt-get remove python3.10 -y
+  apt-get update
+  apt-get install -y \
+    apt-utils \
+    ca-certificates \
+    curl \
+    gnupg2 \
+    wget
+
+  # Add Neuron apt repository
+  curl -fsSL https://apt.repos.neuron.amazonaws.com/GPG-PUB-KEY-AMAZON-AWS-NEURON.PUB | gpg --dearmor -o /usr/share/keyrings/neuron.gpg
+  echo "deb [arch=amd64 signed-by=/usr/share/keyrings/neuron.gpg] https://apt.repos.neuron.amazonaws.com jammy main" | tee /etc/apt/sources.list.d/neuron.list > /dev/null
+  apt-get update
+
+  apt-get remove -y \
+    curl \
+    wget
   apt-get autoremove -y
   apt-get clean
-   rm -rf /var/lib/apt/lists/*
+  find / -name '*.a' | xargs rm -f
+  rm -rf /var/lib/apt/lists/*
 EOT
 
 ###########################################################
@@ -80,18 +72,19 @@ RUN <<EOT
 
   apt-get autoremove -y
   apt-get clean
+  find / -name '*.a' | xargs rm -f
   rm -rf /var/lib/apt/lists/*
 EOT
 
 RUN <<EOT
+  pip install $PIP_ARGS --upgrade pip --trusted-host pypi.org --trusted-host files.pythonhosted.org
   pip install $PIP_ARGS \
     torch==${TORCH_VERSION%\.}+cpu \
     torch-xla==${TORCH_VERSION} \
     torch-neuronx==${TORCH_NEURONX_VERSION} \
     transformers-neuronx==${NEURONX_TRANSFORMERS_VERSION}
 
-  # Do not bring in the dependencies of neuronx-distributed and neuronx-distributed-inference
-  pip install $PIP_ARGS --no-deps \
+  pip install $PIP_ARGS \
     neuronx_distributed==$NEURONX_DISTRIBUTED_VERSION \
     neuronx_distributed_inference==$NEURONX_DISTRIBUTED_INFERENCE_VERSION
 EOT
@@ -109,16 +102,21 @@ RUN <<EOT
   pip install $PIP_ARGS \
     -r requirements-neuron.txt
   pip install $PIP_ARGS .
+  cd /
   rm -rf /tmp/*
 
   # Remove un-needed packages (no images)
   pip uninstall $PIP_ARGS -y \
-    pillow
+    airportsdata \
+    pillow \
+    pycountry \
+    pytest
 
   apt-get remove -y \
     curl
   apt-get autoremove -y
   apt-get clean
+  find / -name '*.a' | xargs rm -f
   rm -rf /var/lib/apt/lists/*
 EOT
 
@@ -134,11 +132,21 @@ RUN <<EOT
 
   ./efa_installer.sh --yes --skip-kmod --skip-limit-conf --no-verify --mpi openmpi4
 
-  echo "/opt/amazon/openmpi/lib" > /etc/ld.so.conf.d/openmpi.conf
+  echo '/opt/amazon/openmpi/lib' > /etc/ld.so.conf.d/openmpi.conf
   ldconfig
 
   apt-get remove -y \
     curl
+  apt-get autoremove -y
+  apt-get clean
+  find / -name '*.a' | xargs rm -f
+  rm -rf /var/lib/apt/lists/*
+EOT
+
+# Will cause layer cache every time
+RUN <<EOT
+  apt-get update
+  apt-get upgrade -y
   apt-get autoremove -y
   apt-get clean
   rm -rf /var/lib/apt/lists/*
@@ -160,4 +168,4 @@ RUN <<EOT
     runai-model-streamer[s3]
 EOT
 
-ENTRYPOINT ["python3", "-m", "vllm.entrypoints.openai.api_server"]
+# ENTRYPOINT ["python3", "-m", "vllm.entrypoints.openai.api_server"]
